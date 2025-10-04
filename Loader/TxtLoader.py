@@ -28,7 +28,6 @@ prompt = PromptTemplate(
     }
 )
 
-
 llm = HuggingFaceEndpoint(
     repo_id="google/gemma-2-2b-it",
     task='text-generation',
@@ -42,5 +41,3 @@ chain =  prompt | model | parser
 result = chain.invoke({"text": documents[0].page_content})
 
 print(result.model_dump_json())
-
-
