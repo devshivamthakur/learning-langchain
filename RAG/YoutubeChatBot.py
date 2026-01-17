@@ -1,263 +1,257 @@
 import streamlit as st
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled
-from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_core.prompts import PromptTemplate
 from langchain_huggingface import HuggingFaceEndpoint, ChatHuggingFace
 from langchain_core.runnables import RunnableParallel, RunnablePassthrough, RunnableLambda
 from langchain_core.output_parsers import StrOutputParser
-from langchain.retrievers.multi_query import MultiQueryRetriever
+from langchain_community.retrievers import BM25Retriever
+from langchain_classic.retrievers import EnsembleRetriever
 from langchain_huggingface import HuggingFaceEndpointEmbeddings
+from langchain_classic.text_splitter import RecursiveCharacterTextSplitter
+from langchain_classic.chains.retrieval_qa.base import RetrievalQA
+from langchain_openai import ChatOpenAI
 from dotenv import load_dotenv
+import os
+from langchain_core.callbacks.base import BaseCallbackHandler
+from youtube_transcript_api.proxies import GenericProxyConfig
 
+base_url = os.getenv("base_url")
+chat_model = os.getenv("chat_model")
+embedding_model = os.getenv("embedding_model")
+openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
+
+class StreamHandler(BaseCallbackHandler):
+    def __init__(self, container):
+        self.container = container
+        self.text = ""
+
+    def on_llm_new_token(self, token: str, **kwargs):
+        self.text += token
+        self.container.markdown(
+            f'<div class="response-box">{self.text}</div>',
+            unsafe_allow_html=True
+        )
+# ================= ENV ==================
 load_dotenv()
 
-# Set page configuration
+# ================= SESSION ==================
+if "vector_store" not in st.session_state:
+    st.session_state.vector_store = None
+    st.session_state.bm25 = None
+    st.session_state.transcript = None
+
+# ================= PAGE ==================
 st.set_page_config(
     page_title="YouTube Video Q&A Assistant",
     page_icon="🎬",
     layout="wide"
 )
 
-# Custom CSS for better styling
+# ================= CSS ==================
 st.markdown("""
 <style>
-    .main-header {
-        font-size: 2.5rem;
-        color: #FF4B4B;
-        text-align: center;
-        margin-bottom: 2rem;
-    }
-    .response-box {
-        background-color: #f0f2f6;
-        padding: 20px;
-        border-radius: 10px;
-        border-left: 5px solid #FF4B4B;
-        margin-top: 20px;
-    }
-    .warning-box {
-        background-color: #fff3cd;
-        padding: 15px;
-        border-radius: 10px;
-        border-left: 5px solid #ffc107;
-        margin: 10px 0;
-    }
+.main-header {font-size:2.5rem;color:#FF4B4B;text-align:center}
+.response-box {background:#000;padding:20px;border-radius:10px;border-left:5px solid #FF4B4B, color:#000;font-size:1.1rem}
+.warning-box {background:#fff3cd;color:#664d03;padding:15px;border-radius:10px;border-left:5px solid #ffc107}
+
+@media (prefers-color-scheme: dark) {
+.warning-box {background:#3b2f00;color:#ffd966;border-left:5px solid #ffcc00;}
+}
 </style>
 """, unsafe_allow_html=True)
 
-# Header
+# ================= HEADER ==================
 st.markdown('<div class="main-header">🎬 YouTube Video Q&A Assistant</div>', unsafe_allow_html=True)
 
-# Sidebar for configuration
+# ================= HELPERS ==================
+
+def translate_to_english(text, llm):
+    prompt = f"""
+Translate the following text into English.
+Return ONLY the translated text.
+
+text to translate: {text}
+"""
+    return llm.invoke(prompt)
+
+@st.cache_data(show_spinner=False)
+def load_transcript(video_id):
+    try:
+        yt = YouTubeTranscriptApi()
+        print("Fetching transcript...", flush=True)
+        trans_list = yt.list(video_id)
+        default = next(t for t in trans_list if t.is_generated)
+        is_english = any(t.language_code == "en" for t in trans_list)
+        transcript_obj = (
+            next(t for t in trans_list if t.language_code == "en")
+            if is_english
+            else default
+        )
+
+        fetched = yt.fetch(video_id, languages=[transcript_obj.language_code])
+        transcript_text = " ".join(x.text for x in fetched)
+
+        return transcript_text
+    except TranscriptsDisabled:
+        st.warning("""
+        <div class="warning-box">
+        ⚠️ Transcripts are disabled for this video. Please enable captions on YouTube or try another video.
+        </div>
+        """, unsafe_allow_html=True)
+        return ""
+    except Exception as e:  
+        print(f"Error loading transcript: {e}", flush=True)
+        st.error(f"❌ Error loading transcript")
+        return ""
+
+@st.cache_resource(show_spinner=False)
+def build_vector_store(transcript, chunk_size, chunk_overlap):
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap
+    )
+    docs = splitter.create_documents([transcript])
+
+    embeddings = HuggingFaceEndpointEmbeddings(
+        repo_id=os.getenv("embedding_model"),
+        huggingfacehub_api_token=os.getenv("HUGGING_FACE_TOKEN")
+    )
+
+    faiss = FAISS.from_documents(docs, embeddings)
+    bm25 = BM25Retriever.from_documents(docs)
+    bm25.k = 4
+
+    return faiss, bm25
+
+
+def process_video():
+    vid = st.session_state.video_id.strip()
+    if not vid:
+        return
+
+    with st.spinner("📥 Loading transcript..."):
+        st.session_state.transcript = load_transcript(vid)
+
+    if not st.session_state.transcript:
+        st.warning("⚠️ No transcript available for this video.")
+        return    
+
+    with st.spinner("🔤 Generating embeddings..."):
+        faiss, bm25 = build_vector_store(
+            st.session_state.transcript,
+            chunk_size=1000,
+            chunk_overlap=200,
+        )
+
+        st.session_state.vector_store = faiss
+        st.session_state.bm25 = bm25
+
+
+# ================= SIDEBAR ==================
 with st.sidebar:
     st.header("⚙️ Configuration")
-    
-    # Video ID input
-    video_id = st.text_input(
-        "YouTube Video ID:",
-        value="Op6PbJZ5b2Q",
-        help="The ID of the YouTube video (found in the URL after 'v=')"
-    )
-    
-    # Model settings
-    st.subheader("Model Settings")
-    embedding_model = st.selectbox(
-        "Embedding Model:",
-        ["BAAI/bge-small-en", "sentence-transformers/all-mpnet-base-v2", "intfloat/e5-small-v2"],
-        index=0
-    )
-    
-    llm_model = st.selectbox(
-        "LLM Model:",
-        ["Qwen/Qwen3-Next-80B-A3B-Instruct", "mistralai/Mistral-7B-Instruct-v0.2", "google/flan-t5-large"],
-        index=0
-    )
-    
-    # Advanced settings
-    with st.expander("Advanced Settings"):
-        chunk_size = st.slider("Chunk Size:", 500, 2000, 1000, 100)
-        chunk_overlap = st.slider("Chunk Overlap:", 0, 500, 200, 50)
-        max_tokens = st.slider("Max Response Tokens:", 50, 300, 150, 25)
-        temperature = st.slider("Temperature:", 0.0, 1.0, 0.5, 0.1)
 
-# Main content area
-col1, col2 = st.columns([1, 1])
+    st.text_input(
+        "YouTube Video ID:",
+        key="video_id",
+        value="",
+        on_change=process_video   # 🔥 AUTO PROCESS
+    )
+
+# ================= MAIN ==================
+col1, col2 = st.columns(2)
 
 with col1:
-    st.header("📺 Video Information")
-    
-    # Display video thumbnail and info
-    if video_id:
-        st.image(f"http://img.youtube.com/vi/{video_id}/0.jpg", use_column_width=True)
-        st.write(f"**Video ID:** {video_id}")
-        st.markdown(f"[Watch on YouTube](https://www.youtube.com/watch?v={video_id})")
+    st.header("📺 Video")
+    vid = st.session_state.get("video_id")
+    if vid:
+        st.image(f"http://img.youtube.com/vi/{vid}/0.jpg")
+        st.markdown(f"[Watch Video](https://www.youtube.com/watch?v={vid})")
 
 with col2:
-    st.header("❓ Ask Questions")
-    
-    # Question input
+    st.header("❓ Ask")
+
     question = st.text_area(
-        "Enter your question about the video:",
-        value="what is the video about?",
-        height=100,
-        placeholder="Ask anything about the video content..."
+        "Ask a question:",
+        value="What is this video about?"
     )
-    
-    # Process button
-    process_btn = st.button("🚀 Process Video & Get Answer", type="primary", use_container_width=True)
 
-# Processing and results section
+    process_btn = st.button(
+        "🚀 Ask",
+        type="primary",
+        use_container_width=True,
+        disabled=not st.session_state.vector_store
+    )
+
+# ================= QA ==================
 if process_btn:
-    if not video_id:
-        st.error("❌ Please enter a YouTube Video ID")
-        st.stop()
-    
-    if not question:
-        st.error("❌ Please enter a question")
-        st.stop()
-    
-    # Initialize progress
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    
-    try:
-        # Step 1: Load YouTube Transcript
-        status_text.text("📥 Loading YouTube transcript...")
-        progress_bar.progress(10)
-        
-        transcript = ''
-        try:
-            youTubeObject = YouTubeTranscriptApi()
-            tempTransList = youTubeObject.list(video_id)
-            # Get the manually created or default transcript (typically the first one)
-            # transcript_obj = tempTransList.find_manually_created() or tempTransList.find_generated_transcript(['en'])
-            default_transcript = ''
-            for t in tempTransList:
-                if t.is_generated:
-                    default_transcript = t
-                    break
 
-            isEnglishAvailable = any(t.language_code == 'en' for t in tempTransList)
-            if isEnglishAvailable:
-                transcript_obj = next(t for t in tempTransList if t.language_code == 'en')
-            else:
-                transcript_obj = default_transcript
-            
-            print(f"Using transcript in language: {transcript_obj.language_code}")
-            #1.2 if transcript_obj.language_code != 'en' then convert to english using llm
-            transcript = " ".join(chunk.text for chunk in youTubeObject.fetch(video_id, languages=[transcript_obj.language_code]))
-            st.success(f"✅ Successfully loaded transcript ({len(transcript)} characters)")
-        except TranscriptsDisabled:
-            st.error("❌ No captions available for this video")
-            st.stop()
-        
-        # Step 2: Chunk the transcript
-        status_text.text("✂️ Chunking transcript...")
-        progress_bar.progress(30)
-        
-        splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-        chunks = splitter.create_documents([transcript])
-        st.info(f"📚 Created {len(chunks)} chunks from the transcript")
-        
-        # Step 3: Generate embeddings
-        status_text.text("🔤 Generating embeddings...")
-        progress_bar.progress(50)
-        
-        embeddings = HuggingFaceEndpointEmbeddings(repo_id=embedding_model)
-        vector_store = FAISS.from_documents(chunks, embeddings)
-        
-        # Step 4: Setup LLM
-        status_text.text("🤖 Initializing language model...")
-        progress_bar.progress(70)
-        
-        llm_endpoint = HuggingFaceEndpoint(
-            repo_id=llm_model,
-            task="text-generation",
-            max_new_tokens=max_tokens,
-            temperature=temperature
-        )
-        
-        chat_model = ChatHuggingFace(llm=llm_endpoint)
-        
-        # Step 5: Create retriever and chain
-        status_text.text("🔗 Setting up Q&A system...")
-        progress_bar.progress(85)
-        
-        retriever = MultiQueryRetriever.from_llm(
-            retriever=vector_store.as_retriever(),
-            llm=chat_model
-        )
-        
-        prompt = PromptTemplate(
-            template="""
-You are a helpful assistant that answers questions about YouTube video content.
-Answer ONLY using the provided transcript context.
-If the context is insufficient, just say you don't know.
+    faiss = st.session_state.vector_store
+    bm25 = st.session_state.bm25
 
-Context from video transcript:
+    retriever = EnsembleRetriever(
+        retrievers=[
+            faiss.as_retriever(search_type="mmr", search_kwargs={"k":6}),
+            bm25
+        ],
+        weights=[0.7, 0.3]
+    )
+    response_box = st.empty()
+
+
+    llm = ChatOpenAI(
+    api_key=openrouter_api_key,
+    base_url=base_url,
+    model=chat_model,
+    temperature=0.2,
+    streaming=True,
+    callbacks=[StreamHandler(response_box)]
+)
+
+    prompt = PromptTemplate(
+        template="""
+Answer only from transcript.
+If unsure say "I don't know".
+
+transcript:
 {context}
 
 Question: {question}
+Answer:""",
+        input_variables=["context","question"]
+    )
 
-Answer: """,
-            input_variables=["context", "question"]
+   # 7. Chain construction
+    def format_docs(retrieved_docs):
+        return "\n\n".join(doc.page_content for doc in retrieved_docs)
+
+    paralle_chain = RunnableParallel({
+    "context": retriever | RunnableLambda(format_docs),
+    "question": RunnablePassthrough()
+   })
+    main_chain = paralle_chain | prompt | llm | StrOutputParser()
+
+    response_container = st.container()
+    st.header("🎯 Answer")
+    full_response = ""
+
+    with st.spinner("💡 Generating answer..."):
+        for chunk in main_chain.stream(question):
+            if "result" in chunk:
+                full_response += chunk["result"]
+                response_box.markdown(
+                    f'<div class="response-box">{full_response}</div>',
+                    unsafe_allow_html=True
+                )
+
+    with st.expander("📄 Transcript Preview"):
+        st.text_area(
+            "Transcript",
+            st.session_state.transcript[:1000],
+            height=200
         )
-        
-        def format_docs(retrieved_docs):
-            return "\n\n".join(doc.page_content for doc in retrieved_docs)
-        
-        paralle_chain = RunnableParallel({
-            "context": retriever | RunnableLambda(format_docs),
-            "question": RunnablePassthrough()
-        })
-        
-        main_chain = paralle_chain | prompt | chat_model | StrOutputParser()
-        
-        # Step 6: Get answer
-        status_text.text("💭 Generating answer...")
-        progress_bar.progress(95)
-        
-        result = main_chain.invoke(question)
-        
-        # Display results
-        progress_bar.progress(100)
-        status_text.text("✅ Complete!")
-        
-        st.header("🎯 Answer")
-        st.markdown(f'<div class="response-box">{result}</div>', unsafe_allow_html=True)
-        
-        # Show transcript preview
-        with st.expander("📄 View Transcript Preview"):
-            st.text_area("First 1000 characters of transcript:", transcript[:1000] + "..." if len(transcript) > 1000 else transcript, height=200)
-        
-    except Exception as e:
-        st.error(f"❌ An error occurred: {str(e)}")
-        st.markdown('<div class="warning-box">Please check your video ID and try again. Make sure the video has captions enabled.</div>', unsafe_allow_html=True)
 
-# Instructions section
-with st.expander("📖 How to use this app"):
-    st.markdown("""
-    1. **Get YouTube Video ID**: 
-       - Go to any YouTube video
-       - Copy the ID from the URL (the part after `v=`)
-       - Example: For `https://www.youtube.com/watch?v=abc123`, the ID is `abc123`
-    
-    2. **Configure Models** (optional):
-       - Choose different embedding models for processing text
-       - Select different language models for answering questions
-       - Adjust advanced settings for better results
-    
-    3. **Ask Questions**:
-       - Enter any question about the video content
-       - Click "Process Video & Get Answer"
-       - Wait for the AI to analyze the transcript and provide an answer
-    
-    **Note**: The video must have captions available for this to work.
-    """)
-
-# Footer
+# ================= FOOTER ==================
 st.markdown("---")
-st.markdown(
-    "Built with ❤️ using Streamlit, LangChain, and Hugging Face | "
-    "Note: Processing may take some time depending on video length and model sizes"
-)
+st.markdown("Built with ❤️ Streamlit + LangChain")
